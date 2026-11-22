@@ -1,109 +1,58 @@
-name: Build Kernel
+name: Build LineageOS 22 Kernel for Xiaomi 10 (umi)
 
 on:
-  push:
-    branches: [ android15-lineage22-mod ]
-  pull_request:
-    branches: [ android15-lineage22-mod ]
   workflow_dispatch:
-    inputs:
-      variant:
-        description: 'Kernel variant (MIUI / AOSP / both)'
-        required: true
-        type: choice
-        options:
-          - both
-          - miui
-          - aosp
-        default: both
-      ksu:
-        description: 'Enable KernelSU with SUSFS (BakaSU)'
-        required: true
-        type: boolean
-        default: true
+  push:
+    paths:
+      - 'umi_defconfig'
+      - '.github/workflows/build.yml'
 
 jobs:
-  build-kernel:
-    name: Build umi | ${{ matrix.variant }} | ${{ github.event_name == 'push' && 'KSU' || (github.event.inputs.ksu == 'true' && 'KSU' || 'NoKSU') }}
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        # Push/PR always build both variants (the input is empty there);
-        # workflow_dispatch narrows the matrix to the requested variant.
-        variant: ${{ (github.event.inputs.variant == 'miui' && fromJSON('["miui"]')) || (github.event.inputs.variant == 'aosp' && fromJSON('["aosp"]')) || fromJSON('["miui","aosp"]') }}
-
+  build:
+    runs-on: ubuntu-22.04
     steps:
-      - name: Checkout Repository
+      - name: Checkout Workflow Repo
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Set up Environment
+      - name: Install Build Dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc bison build-essential ccache curl flex gawk \
-            git gnupg gperf libncurses-dev \
-            lib32readline-dev lib32z1-dev lz4 \
-            libsdl1.2-dev libssl-dev libxml2-utils lzop pngcrush rsync \
-            schedtool squashfs-tools xsltproc zip zlib1g-dev python3 \
-            clang lld gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
-            gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi
+          sudo apt-get install -y bc bison build-essential ccache curl flex git libssl-dev libelf-dev python3 zip unzip device-tree-compiler
 
-      - name: Cache ccache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ccache_mikernel
-          key: ${{ runner.os }}-kernel-ccache-umi-${{ matrix.variant }}-${{ github.run_id }}
-          restore-keys: |
-            ${{ runner.os }}-kernel-ccache-umi-${{ matrix.variant }}-
-            ${{ runner.os }}-kernel-ccache-umi-
-            ${{ runner.os }}-kernel-ccache-
-
-      - name: Setup proton-clang Toolchain
+      - name: Clone LineageOS 22 SM8250 Kernel Source
         run: |
-          TC="$HOME/proton-clang/proton-clang-20210522/bin"
-          mkdir -p "$TC"
-          cd "$TC"
-          ln -sf "$(command -v clang)" clang
-          ln -sf "$(command -v ld.lld)" ld.lld
-          for p in aarch64-linux-gnu arm-linux-gnueabi; do
-            for t in ld as ar nm objcopy objdump strip readelf gcc g++ cpp; do
-              if command -v $p-$t >/dev/null; then
-                ln -sf "$(command -v $p-$t)" "$p-$t"
-              fi
-            done
-          done
-          # Enable ccache for clang via PATH symlink
-          sudo ln -sf "$(command -v ccache)" /usr/lib/ccache/clang
+          git clone --depth=1 -b lineage-22.2 https://github.com/LineageOS/android_kernel_xiaomi_sm8250.git kernel || \
+          git clone --depth=1 -b lineage-22.1 https://github.com/LineageOS/android_kernel_xiaomi_sm8250.git kernel
 
-      - name: Run Build Script
+      - name: Download AOSP Clang Toolchain
         run: |
-          chmod +x build.sh
+          mkdir -p clang
+          curl -sL "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r536225.tar.gz" -o clang.tar.gz
+          tar -xzf clang.tar.gz -C clang
+          rm -f clang.tar.gz
 
-          ARGS="umi"
+      - name: Configure Kernel with Custom umi_defconfig
+        run: |
+          mkdir -p kernel/out
+          cp umi_defconfig kernel/out/.config
+          cd kernel
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          make O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
 
-          if [ "${{ github.event_name }}" = "push" ] || [ "${{ github.event_name }}" = "pull_request" ]; then
-            ARGS="$ARGS ksu"
-          elif [ "${{ github.event.inputs.ksu }}" = "true" ]; then
-            ARGS="$ARGS ksu"
-          fi
+      - name: Build Image and DTB
+        run: |
+          cd kernel
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          make -j$(nproc) O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 Image dtb
 
-          ARGS="$ARGS ${{ matrix.variant }}"
+      - name: Package Artifacts
+        run: |
+          mkdir -p dist
+          cp kernel/out/arch/arm64/boot/Image dist/
+          find kernel/out/arch/arm64/boot/dts -name "*.dtb" -exec cat {} + > dist/dtb
 
-          # Tag bpf-branch artifacts so they cannot be confused with the
-          # android15 ones; build.sh appends _BPF to the zip name.
-          if [ "${{ github.ref_name }}" = "backport-5.10-bpf" ]; then
-            ARGS="$ARGS BPF"
-          fi
-
-          echo "Executing command: ./build.sh $ARGS"
-          ./build.sh $ARGS
-
-      - name: Upload Flashable ZIP
+      - name: Upload Compiled Kernel & DTB
         uses: actions/upload-artifact@v4
         with:
-          name: Kernel-umi-${{ matrix.variant }}-${{ github.event_name == 'push' && 'KSU' || (github.event.inputs.ksu == 'true' && 'KSU' || 'NoKSU') }}${{ (github.ref_name == 'backport-5.10-bpf' && '-BPF') || '' }}-${{ github.run_id }}
-          path: "*.zip"
-          compression-level: 0
-          if-no-files-found: ignore
+          name: umi-lineage22-kernel
+          path: dist/
